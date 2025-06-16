@@ -1,5 +1,5 @@
 import streamlit as st
-import sounddevice as sd
+from streamlit_mic_recorder import mic_recorder
 import soundfile as sf
 import numpy as np
 import os
@@ -723,18 +723,31 @@ def user_interface():
 
 def handle_recording(model, label_encoder):
     try:
-        with st.spinner("🎙️ Sedang merekam suara... (3 detik)"):
-            fs = 16000
-            duration = 3
-            audio = sd.rec(int(duration * fs), samplerate=fs, channels=1)
-            sd.wait()
-            
-            # Save the recorded audio to a temporary file
-            filename = f"data/{st.session_state.current_user}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-            sf.write(filename, audio, fs)
-            
-            # Process the audio
-            process_audio_file(filename, model, label_encoder, is_recorded=True)
+        st.info("🎙️ Klik tombol mikrofon di bawah untuk merekam suara (3 detik)")
+        
+        # Use streamlit-mic-recorder for recording
+        audio_data = mic_recorder(
+            start_prompt="🎙️ Mulai Rekam",
+            stop_prompt="⏹️ Stop Rekam", 
+            just_once=False,
+            use_container_width=True,
+            callback=None,
+            args=(),
+            kwargs={},
+            key="mic_recorder"
+        )
+        
+        if audio_data is not None:
+            with st.spinner("🔄 Memproses rekaman audio..."):
+                # Save the recorded audio to a temporary file
+                filename = f"data/{st.session_state.current_user}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+                
+                # Save the audio data
+                with open(filename, "wb") as f:
+                    f.write(audio_data['bytes'])
+                
+                # Process the audio
+                process_audio_file(filename, model, label_encoder, is_recorded=True)
 
     except Exception as e:
         st.error(f"❌ Gagal merekam audio: {e}")
