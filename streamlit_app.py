@@ -22,13 +22,22 @@ import matplotlib.pyplot as plt
 import base64
 from io import BytesIO
 
-# ML imports
+# ML imports - Configure environment before importing TensorFlow
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 os.environ['TF_METAL_DISABLE'] = '1'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress all TensorFlow messages
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable oneDNN optimizations
+os.environ['TF_DISABLE_MKL'] = '1'  # Disable MKL optimizations
 
 import tensorflow as tf
 from sklearn.preprocessing import LabelEncoder
+
+# Configure TensorFlow for cloud deployment - must be called before any TF operations
+tf.config.set_visible_devices([], 'GPU')  # Disable GPU completely
+tf.config.threading.set_inter_op_parallelism_threads(1)  # Limit threading
+tf.config.threading.set_intra_op_parallelism_threads(1)  # Limit threading
+tf.get_logger().setLevel('ERROR')  # Reduce TensorFlow logging
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -39,13 +48,7 @@ logging.getLogger('tensorflow').setLevel(logging.WARNING)
 os.makedirs('data', exist_ok=True)
 os.makedirs('models', exist_ok=True)
 
-# Konfigurasi Halaman
-st.set_page_config(
-    page_title="Emergency Voice Detection System",
-    page_icon="🚨",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)    
+# Page configuration will be set in main()
 
 # Constants for audio processing
 TARGET_SR = 16000
@@ -61,23 +64,48 @@ MIN_MFCC_FRAMES = 9
 # Load model and label encoder (cached)
 @st.cache_resource
 def load_model_and_encoder():
-    """Load LSTM model and label encoder"""
+    """Load LSTM model and label encoder with optimizations for cloud deployment"""
     try:
         logger.info("Loading LSTM model...")
-        model = tf.keras.models.load_model('models/van_et_al.h5', compile=False)
-        model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+        
+        # Check if model file exists
+        model_path = 'models/van_et_al.h5'
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+        
+        # Load model with memory optimization
+        with tf.device('/CPU:0'):  # Force CPU usage
+            model = tf.keras.models.load_model(
+                model_path, 
+                compile=False,
+                options=tf.saved_model.LoadOptions(experimental_io_device='/job:localhost')
+            )
+            
+            # Compile with memory-efficient settings
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+                loss='categorical_crossentropy', 
+                metrics=['accuracy'],
+                run_eagerly=False
+            )
+            
         logger.info(f"Model loaded successfully. Input shape: {model.input_shape}")
         
         # Load label encoder classes
-        label_encoder_classes = np.load('models/label_encoder_classes.npy', allow_pickle=True)
+        encoder_path = 'models/label_encoder_classes.npy'
+        if not os.path.exists(encoder_path):
+            raise FileNotFoundError(f"Label encoder file not found: {encoder_path}")
+            
+        label_encoder_classes = np.load(encoder_path, allow_pickle=True)
         label_encoder = LabelEncoder()
         label_encoder.classes_ = label_encoder_classes
         logger.info(f"Label encoder loaded with classes: {label_encoder.classes_}")
         
         return model, label_encoder
+        
     except Exception as e:
-        st.error(f"Error loading model: {e}")
-        st.stop()
+        logger.error(f"Error loading model: {str(e)}")
+        raise Exception(f"Model loading failed: {str(e)}")
 
 # Audio processing functions
 def preprocess_audio(audio_data, sr):
@@ -525,8 +553,52 @@ class AudioRecorder:
 
 # Main User Interface
 def user_interface():
-    # Load model and encoder
-    model, label_encoder = load_model_and_encoder()
+    # Initialize model loading state
+    if 'model_loaded' not in st.session_state:
+        st.session_state.model_loaded = False
+        st.session_state.model = None
+        st.session_state.label_encoder = None
+    
+    # Load model and encoder (non-blocking)
+    if not st.session_state.model_loaded:
+        st.markdown("## 🤖 Initializing Emergency Voice Detection System")
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        try:
+            status_text.text("🔄 Loading TensorFlow model...")
+            progress_bar.progress(25)
+            
+            model, label_encoder = load_model_and_encoder()
+            
+            progress_bar.progress(75)
+            status_text.text("✅ Model loaded successfully!")
+            
+            st.session_state.model = model
+            st.session_state.label_encoder = label_encoder
+            st.session_state.model_loaded = True
+            
+            progress_bar.progress(100)
+            status_text.text("🚀 System ready!")
+            
+            # Small delay to show completion
+            import time
+            time.sleep(1)
+            
+            st.rerun()
+            
+        except Exception as e:
+            progress_bar.empty()
+            status_text.empty()
+            st.error(f"❌ Failed to load model: {e}")
+            st.error("Please refresh the page to try again.")
+            st.stop()
+        return
+    
+    # Use loaded model from session state
+    model = st.session_state.model
+    label_encoder = st.session_state.label_encoder
     
     # Main Header
     st.markdown("""
@@ -838,7 +910,19 @@ def process_audio_file(audio_path, model, label_encoder, is_recorded=True):
         logger.error(f"Error processing audio: {e}")
 
 def main():
-    user_interface()
+    try:
+        user_interface()
+    except Exception as e:
+        st.error(f"❌ Application error: {str(e)}")
+        logger.error(f"Main application error: {str(e)}")
 
 if __name__ == "__main__":
+    # Add a basic health check endpoint that responds quickly
+    st.set_page_config(
+        page_title="Emergency Voice Detection System",
+        page_icon="🚨",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
     main()
