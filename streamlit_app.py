@@ -1,4 +1,14 @@
 import streamlit as st
+
+# Configure page FIRST - before any other Streamlit commands
+st.set_page_config(
+    page_title="Emergency Voice Detection System",
+    page_icon="🚨",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Now import other modules
 from streamlit_mic_recorder import mic_recorder
 import soundfile as sf
 import numpy as np
@@ -917,12 +927,4 @@ def main():
         logger.error(f"Main application error: {str(e)}")
 
 if __name__ == "__main__":
-    # Add a basic health check endpoint that responds quickly
-    st.set_page_config(
-        page_title="Emergency Voice Detection System",
-        page_icon="🚨",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-    
     main()
