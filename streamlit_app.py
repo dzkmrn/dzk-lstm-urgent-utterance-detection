@@ -801,7 +801,7 @@ def user_interface():
 
 def handle_recording(model, label_encoder):
     try:
-        st.info("🎙️ Klik tombol mikrofon di bawah untuk merekam suara (3 detik)")
+        st.info("🎙️ Klik tombol mikrofon di bawah untuk merekam suara")
         
         # Use streamlit-mic-recorder for recording
         audio_data = mic_recorder(
@@ -816,19 +816,35 @@ def handle_recording(model, label_encoder):
         )
         
         if audio_data is not None:
+            st.success("✅ Audio berhasil direkam!")
+            
             with st.spinner("🔄 Memproses rekaman audio..."):
-                # Save the recorded audio to a temporary file
-                filename = f"data/{st.session_state.current_user}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-                
-                # Save the audio data
-                with open(filename, "wb") as f:
-                    f.write(audio_data['bytes'])
-                
-                # Process the audio
-                process_audio_file(filename, model, label_encoder, is_recorded=True)
+                try:
+                    # Save the recorded audio to a temporary file
+                    filename = f"data/{st.session_state.current_user}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+                    
+                    # Save the audio data (mic_recorder returns dict with 'bytes' key)
+                    with open(filename, "wb") as f:
+                        f.write(audio_data['bytes'])
+                    
+                    st.info(f"📁 File audio disimpan sebagai: {filename}")
+                    
+                    # Verify file was created and has content
+                    if os.path.exists(filename) and os.path.getsize(filename) > 0:
+                        st.success(f"✅ File berhasil disimpan ({os.path.getsize(filename)} bytes)")
+                        
+                        # Process the audio
+                        process_audio_file(filename, model, label_encoder, is_recorded=True)
+                    else:
+                        st.error("❌ File audio kosong atau tidak dapat disimpan")
+                        
+                except Exception as processing_error:
+                    st.error(f"❌ Error saat memproses audio: {str(processing_error)}")
+                    logger.error(f"Audio processing error: {str(processing_error)}")
 
     except Exception as e:
         st.error(f"❌ Gagal merekam audio: {e}")
+        logger.error(f"Recording error: {str(e)}")
 
 def handle_upload(uploaded_file, model, label_encoder):
     try:
@@ -847,32 +863,57 @@ def handle_upload(uploaded_file, model, label_encoder):
 def process_audio_file(audio_path, model, label_encoder, is_recorded=True):
     """Process audio file and generate predictions and visualizations"""
     try:
+        st.info(f"🔄 Memulai analisis file: {audio_path}")
+        
         with st.spinner("🔄 Menganalisis audio..."):
+            # Check if file exists and has content
+            if not os.path.exists(audio_path):
+                st.error(f"❌ File tidak ditemukan: {audio_path}")
+                return
+                
+            file_size = os.path.getsize(audio_path)
+            if file_size == 0:
+                st.error(f"❌ File kosong: {audio_path}")
+                return
+                
+            st.info(f"📊 Memuat file audio ({file_size} bytes)...")
+            
             # Load and preprocess audio
             audio_data, sr = librosa.load(audio_path, sr=None)
+            st.info(f"✅ Audio dimuat - Sample rate: {sr}, Duration: {len(audio_data)/sr:.2f}s")
+            
             processed_audio = preprocess_audio(audio_data, sr)
             
             if processed_audio is None:
                 st.error("❌ Gagal memproses audio")
                 return
+                
+            st.info("✅ Audio berhasil dipreprocess")
             
             # Save processed audio
             processed_filename = f"data/processed_{st.session_state.current_user}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
             sf.write(processed_filename, processed_audio, TARGET_SR)
+            st.info(f"✅ Audio processed disimpan: {processed_filename}")
             
             # Extract features for prediction
+            st.info("🔍 Mengekstrak fitur MFCC...")
             features = extract_mfcc_features(processed_audio, TARGET_SR)
             
             if features is None:
                 st.error("❌ Gagal mengekstrak fitur audio")
                 return
+                
+            st.info(f"✅ Fitur MFCC berhasil diekstrak - Shape: {features.shape}")
             
             # Make prediction
+            st.info("🤖 Melakukan prediksi dengan model AI...")
             predicted_class, confidence = predict_audio(features, model, label_encoder)
             
             if predicted_class is None:
                 st.error("❌ Gagal melakukan prediksi")
                 return
+                
+            st.success(f"✅ Prediksi berhasil - Kelas: {predicted_class}, Confidence: {confidence:.2f}")
             
             # Determine if urgent
             is_urgent = predicted_class == 'kata_darurat'
