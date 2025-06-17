@@ -85,11 +85,7 @@ def load_model_and_encoder():
         
         # Load model with memory optimization
         with tf.device('/CPU:0'):  # Force CPU usage
-            model = tf.keras.models.load_model(
-                model_path, 
-                compile=False,
-                options=tf.saved_model.LoadOptions(experimental_io_device='/job:localhost')
-            )
+            model = tf.keras.models.load_model(model_path, compile=False)
             
             # Compile with memory-efficient settings
             model.compile(
