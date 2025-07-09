@@ -8,31 +8,34 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Now import other modules
-from streamlit_mic_recorder import mic_recorder
-import soundfile as sf
 import numpy as np
+import librosa
+import librosa.display
+import tensorflow as tf
+import sounddevice as sd
+import soundfile as sf
+from scipy.io import wavfile
+import tempfile
 import os
-import hashlib  
+from pydub import AudioSegment
+import io
+import threading
+import queue
+from tensorflow.keras.models import load_model
+from sklearn.preprocessing import LabelEncoder
+import time
+import logging
+import datetime
+import matplotlib.pyplot as plt
 import pandas as pd
+import hashlib
+import json
 from streamlit_extras.colored_header import colored_header
 from streamlit_extras.stylable_container import stylable_container
-import json
-import streamlit.components.v1 as components
-from datetime import datetime
-import logging
-
-# Audio processing imports
-import librosa
-import librosa.effects
-import librosa.display
-import matplotlib
-matplotlib.use('Agg')  
-import matplotlib.pyplot as plt
 import base64
 from io import BytesIO
 
-# ML imports - Configure environment before importing TensorFlow
+# Configure TensorFlow for cloud deployment
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 os.environ['TF_METAL_DISABLE'] = '1'
@@ -40,25 +43,33 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress all TensorFlow messages
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable oneDNN optimizations
 os.environ['TF_DISABLE_MKL'] = '1'  # Disable MKL optimizations
 
-import tensorflow as tf
-from sklearn.preprocessing import LabelEncoder
-
-# Configure TensorFlow for cloud deployment - must be called before any TF operations
 tf.config.set_visible_devices([], 'GPU')  # Disable GPU completely
 tf.config.threading.set_inter_op_parallelism_threads(1)  # Limit threading
 tf.config.threading.set_intra_op_parallelism_threads(1)  # Limit threading
 tf.get_logger().setLevel('ERROR')  # Reduce TensorFlow logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure comprehensive logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('app_debug.log', mode='w')
+    ]
+)
 logger = logging.getLogger(__name__)
-logging.getLogger('tensorflow').setLevel(logging.WARNING)
+logging.getLogger('tensorflow').setLevel('WARNING')
+logging.getLogger('librosa').setLevel('WARNING')
+
+# Create a separate logger for debugging
+debug_logger = logging.getLogger('DEBUG')
+debug_logger.setLevel(logging.DEBUG)
 
 # Create necessary directories
 os.makedirs('data', exist_ok=True)
 os.makedirs('models', exist_ok=True)
-
-# Page configuration will be set in main()
+os.makedirs("processed", exist_ok=True)
+os.makedirs("uploaded", exist_ok=True)
 
 # Constants for audio processing
 TARGET_SR = 16000
@@ -70,297 +81,7 @@ FMIN = 0
 FMAX = None
 DURATION = 3  # seconds
 MIN_MFCC_FRAMES = 9
-
-# Load model and label encoder (cached)
-@st.cache_resource
-def load_model_and_encoder():
-    """Load LSTM model and label encoder with optimizations for cloud deployment"""
-    try:
-        logger.info("Loading LSTM model...")
-        
-        # Check if model file exists
-        model_path = 'models/van_et_al.h5'
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model file not found: {model_path}")
-        
-        # Load model with memory optimization
-        with tf.device('/CPU:0'):  # Force CPU usage
-            model = tf.keras.models.load_model(model_path, compile=False)
-            
-            # Compile with memory-efficient settings
-            model.compile(
-                optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-                loss='categorical_crossentropy', 
-                metrics=['accuracy'],
-                run_eagerly=False
-            )
-            
-        logger.info(f"Model loaded successfully. Input shape: {model.input_shape}")
-        
-        # Load label encoder classes
-        encoder_path = 'models/label_encoder_classes.npy'
-        if not os.path.exists(encoder_path):
-            raise FileNotFoundError(f"Label encoder file not found: {encoder_path}")
-            
-        label_encoder_classes = np.load(encoder_path, allow_pickle=True)
-        label_encoder = LabelEncoder()
-        label_encoder.classes_ = label_encoder_classes
-        logger.info(f"Label encoder loaded with classes: {label_encoder.classes_}")
-        
-        return model, label_encoder
-        
-    except Exception as e:
-        logger.error(f"Error loading model: {str(e)}")
-        raise Exception(f"Model loading failed: {str(e)}")
-
-# Audio processing functions
-def preprocess_audio(audio_data, sr):
-    """Preprocess audio data"""
-    try:
-        # Convert to mono if stereo
-        if len(audio_data.shape) > 1:
-            audio_data = np.mean(audio_data, axis=1)
-        
-        # Resample if needed
-        if sr != TARGET_SR:
-            audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=TARGET_SR)
-        
-        # Truncate silence
-        audio_data, _ = librosa.effects.trim(audio_data, top_db=15)
-        
-        # Pad if needed
-        audio_data = pad_audio_min_length(audio_data, TARGET_SR)
-        
-        return audio_data
-    except Exception as e:
-        logger.error(f"Error in audio preprocessing: {e}")
-        return None
-
-def pad_audio_min_length(audio, sr, min_mfcc_frames=MIN_MFCC_FRAMES, n_fft=N_FFT, hop_length=HOP_LENGTH):
-    """Pad audio to ensure minimum MFCC frames"""
-    min_len_samples = n_fft + hop_length * (min_mfcc_frames - 1)
-    if len(audio) < min_len_samples:
-        pad_amount = min_len_samples - len(audio)
-        audio = np.pad(audio, (0, pad_amount), mode='constant')
-    return audio
-
-def extract_mfcc_features(audio, sr):
-    """Extract MFCC + delta + delta-delta features for model input"""
-    try:
-        # Extract MFCC features
-        mfcc = librosa.feature.mfcc(
-            y=audio, 
-            sr=sr,
-            n_mfcc=N_MFCC,
-            n_mels=N_MELS,
-            hop_length=HOP_LENGTH,
-            n_fft=N_FFT,
-            fmin=FMIN,
-            fmax=FMAX
-        )
-        
-        # Transpose to get time as first dimension
-        mfcc = mfcc.T
-        
-        # Pad or truncate to match model's expected input length
-        target_length = 104  # Model's expected input length
-        if mfcc.shape[0] > target_length:
-            mfcc = mfcc[:target_length, :]
-        elif mfcc.shape[0] < target_length:
-            mfcc = np.pad(mfcc, ((0, target_length - mfcc.shape[0]), (0, 0)), mode='constant')
-        
-        # Reshape to match model's expected input shape (None, 104, 13, 3)
-        mfcc = np.expand_dims(mfcc, axis=-1)  # Add channel dimension
-        mfcc = np.repeat(mfcc, 3, axis=-1)    # Repeat to get 3 channels
-        mfcc = np.expand_dims(mfcc, axis=0)   # Add batch dimension
-        
-        return mfcc
-    except Exception as e:
-        logger.error(f"Error extracting MFCC features: {e}")
-        return None
-
-def predict_audio(features, model, label_encoder):
-    """Make prediction using the model"""
-    try:
-        # Verify input shape before prediction
-        if features.shape != (1, 104, 13, 3):
-            raise ValueError(f"Invalid input shape for prediction: {features.shape}. Expected (1, 104, 13, 3)")
-        
-        # Make prediction
-        prediction = model.predict(features, verbose=0)
-        predicted_class = label_encoder.inverse_transform([np.argmax(prediction)])[0]
-        confidence = np.max(prediction)
-        
-        return predicted_class, confidence
-    except Exception as e:
-        logger.error(f"Error making prediction: {str(e)}")
-        return None, None
-
-def generate_comprehensive_visualizations(original_audio_path, processed_audio_data, sr=TARGET_SR):
-    """Generate comprehensive visualizations showing the complete processing pipeline"""
-    try:
-        # Load original audio
-        y_original, sr_orig = librosa.load(original_audio_path, sr=None)
-        if sr_orig != TARGET_SR:
-            y_original_resampled = librosa.resample(y_original, orig_sr=sr_orig, target_sr=TARGET_SR)
-        else:
-            y_original_resampled = y_original
-        
-        # Use processed audio data
-        y_processed = processed_audio_data
-        
-        # Create figure with 4 subplots (2x2)
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
-        
-        # 1. Original Waveform
-        time_orig = np.linspace(0, len(y_original_resampled)/TARGET_SR, len(y_original_resampled))
-        ax1.plot(time_orig, y_original_resampled, color='blue', alpha=0.7)
-        ax1.set_title('🎵 Waveform Input Original', fontsize=14, fontweight='bold')
-        ax1.set_xlabel('Waktu (detik)')
-        ax1.set_ylabel('Amplitudo')
-        ax1.grid(True, alpha=0.3)
-        ax1.set_xlim(0, max(time_orig))
-        
-        # 2. Processed Waveform (after preprocessing)
-        time_proc = np.linspace(0, len(y_processed)/TARGET_SR, len(y_processed))
-        ax2.plot(time_proc, y_processed, color='green', alpha=0.7)
-        ax2.set_title('🔧 Waveform Setelah Preprocessing', fontsize=14, fontweight='bold')
-        ax2.set_xlabel('Waktu (detik)')
-        ax2.set_ylabel('Amplitudo')
-        ax2.grid(True, alpha=0.3)
-        ax2.set_xlim(0, max(time_proc))
-        
-        # 3. MFCC Features (basic)
-        mfcc_basic = librosa.feature.mfcc(y=y_processed, sr=sr, n_mfcc=N_MFCC, n_fft=N_FFT, hop_length=HOP_LENGTH)
-        img1 = librosa.display.specshow(mfcc_basic, sr=sr, x_axis='time', ax=ax3, cmap='viridis')
-        ax3.set_title('📊 MFCC Features (13 coefficients)', fontsize=14, fontweight='bold')
-        ax3.set_xlabel('Waktu (detik)')
-        ax3.set_ylabel('MFCC Coefficients')
-        fig.colorbar(img1, ax=ax3, format="%.2f")
-        
-        # 4. MFCC + Delta + Delta-Delta (what model actually uses)
-        mfcc = librosa.feature.mfcc(y=y_processed, sr=sr, n_mfcc=N_MFCC, n_fft=N_FFT, hop_length=HOP_LENGTH)
-        delta = librosa.feature.delta(mfcc)
-        delta2 = librosa.feature.delta(mfcc, order=2)
-        
-        # Stack all features (3, 13, time_steps)
-        mfcc_stack = np.stack([mfcc, delta, delta2], axis=0)
-        # Reshape to (time_steps, 13, 3) then flatten to (time_steps, 39) for visualization
-        mfcc_combined = mfcc_stack.transpose(2, 1, 0)  # (time_steps, 13, 3)
-        mfcc_flattened = mfcc_combined.reshape(mfcc_combined.shape[0], -1)  # (time_steps, 39)
-        
-        img2 = ax4.imshow(mfcc_flattened.T, aspect='auto', origin='lower', cmap='plasma')
-        ax4.set_title('🎯 MFCC + Delta + Delta-Delta (Input Model)', fontsize=14, fontweight='bold')
-        ax4.set_xlabel('Time Frames')
-        ax4.set_ylabel('Features (MFCC + Δ + ΔΔ)')
-        
-        # Add feature labels
-        feature_labels = []
-        for i in range(13):
-            feature_labels.append(f'MFCC_{i+1}')
-        for i in range(13):
-            feature_labels.append(f'Δ_{i+1}')
-        for i in range(13):
-            feature_labels.append(f'ΔΔ_{i+1}')
-        
-        # Set y-tick labels for every 5th feature to avoid crowding
-        y_ticks = range(0, 39, 5)
-        ax4.set_yticks(y_ticks)
-        ax4.set_yticklabels([feature_labels[i] for i in y_ticks], fontsize=8)
-        
-        fig.colorbar(img2, ax=ax4, format="%.2f")
-        
-        # Adjust layout
-        plt.tight_layout()
-        
-        # Convert to base64
-        buffer = BytesIO()
-        plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
-        buffer.seek(0)
-        image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-        plt.close(fig)
-        
-        return image_base64
-    except Exception as e:
-        logger.error(f"Error generating comprehensive visualizations: {str(e)}")
-        return None
-
-def generate_audio_visualizations(audio_path):
-    """Generate waveform and spectrogram visualizations"""
-    try:
-        # Load audio
-        y, sr = librosa.load(audio_path, sr=TARGET_SR)
-        
-        # Create figure with two subplots
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
-        
-        # Plot waveform
-        librosa.display.waveshow(y, sr=sr, ax=ax1)
-        ax1.set_title('Waveform', fontsize=14, fontweight='bold')
-        ax1.set_xlabel('Waktu (detik)')
-        ax1.set_ylabel('Amplitudo')
-        ax1.grid(True, alpha=0.3)
-        
-        # Plot spectrogram
-        D = librosa.amplitude_to_db(np.abs(librosa.stft(y)), ref=np.max)
-        img = librosa.display.specshow(D, y_axis='log', x_axis='time', sr=sr, ax=ax2)
-        ax2.set_title('Spectrogram', fontsize=14, fontweight='bold')
-        ax2.set_xlabel('Waktu (detik)')
-        ax2.set_ylabel('Frekuensi (Hz)')
-        
-        # Add colorbar
-        fig.colorbar(img, ax=ax2, format="%+2.f dB")
-        
-        # Adjust layout
-        plt.tight_layout()
-        
-        # Convert to base64
-        buffer = BytesIO()
-        plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
-        buffer.seek(0)
-        image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-        plt.close(fig)
-        
-        return image_base64
-    except Exception as e:
-        logger.error(f"Error generating visualizations: {str(e)}")
-        return None
-
-def generate_mfcc_visualization(audio_path):
-    """Generate MFCC feature visualization"""
-    try:
-        # Load audio
-        y, sr = librosa.load(audio_path, sr=TARGET_SR)
-        
-        # Extract MFCC features
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=N_MFCC, n_fft=N_FFT, hop_length=HOP_LENGTH)
-        
-        # Create figure
-        fig, ax = plt.subplots(figsize=(12, 6))
-        
-        # Plot MFCC
-        img = librosa.display.specshow(mfcc, sr=sr, x_axis='time', ax=ax, cmap='coolwarm')
-        ax.set_title('MFCC Features', fontsize=14, fontweight='bold')
-        ax.set_xlabel('Waktu (detik)')
-        ax.set_ylabel('MFCC Coefficients')
-        
-        # Add colorbar
-        fig.colorbar(img, ax=ax, format="%.2f")
-        
-        # Adjust layout
-        plt.tight_layout()
-        
-        # Convert to base64
-        buffer = BytesIO()
-        plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
-        buffer.seek(0)
-        image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-        plt.close(fig)
-        
-        return image_base64
-    except Exception as e:
-        logger.error(f"Error generating MFCC visualization: {str(e)}")
-        return None
+ALLOWED_EXTENSIONS = {'wav', 'mp3', 'ogg', 'flac', 'm4a'}
 
 # Custom CSS - Enhanced Design
 st.markdown("""
@@ -489,21 +210,6 @@ st.markdown("""
         100% { transform: scale(1); }
     }
 
-    /* Sidebar Styling */
-    .css-1d391kg {
-        background: rgba(255, 255, 255, 0.95) !important;
-        backdrop-filter: blur(10px) !important;
-    }
-
-    /* Metrics */
-    [data-testid="metric-container"] {
-        background: rgba(255, 255, 255, 0.9);
-        padding: 1rem;
-        border-radius: 10px;
-        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
-        margin: 0.5rem 0;
-    }
-
     /* Buttons */
     .stButton > button {
         background: linear-gradient(45deg, #3498db, #2980b9);
@@ -522,6 +228,15 @@ st.markdown("""
         box-shadow: 0 6px 20px rgba(52, 152, 219, 0.4);
     }
 
+    /* Metrics */
+    [data-testid="metric-container"] {
+        background: rgba(255, 255, 255, 0.9);
+        padding: 1rem;
+        border-radius: 10px;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+        margin: 0.5rem 0;
+    }
+
     /* Expander */
     .streamlit-expanderHeader {
         background: rgba(255, 255, 255, 0.9);
@@ -537,46 +252,650 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state
-if 'current_user' not in st.session_state:
-    st.session_state.current_user = "user_" + hashlib.md5(str(datetime.now()).encode()).hexdigest()[:8]
-
-# Simple user database
-USERS_DB = {
-    st.session_state.current_user: {
-        "history": []
-    }
-}
+# User database functionality
+USERS_DB = {}
 
 def save_users_db():
-    # Simple function to maintain compatibility
+    """Save users database to file"""
+    try:
+        with open('data/users_db.json', 'w') as f:
+            json.dump(USERS_DB, f, indent=2)
+    except Exception as e:
+        debug_logger.error(f"Error saving users database: {e}")
+
+def load_users_db():
+    """Load users database from file"""
+    try:
+        if os.path.exists('data/users_db.json'):
+            with open('data/users_db.json', 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        debug_logger.error(f"Error loading users database: {e}")
+    return {}
+
+# Initialize user database
+USERS_DB = load_users_db()
+
+# Initialize session state for current user
+if 'current_user' not in st.session_state:
+    st.session_state.current_user = 'default_user'
+    if st.session_state.current_user not in USERS_DB:
+        USERS_DB[st.session_state.current_user] = {
+            'history': [],
+            'created_at': datetime.datetime.now().isoformat()
+        }
+        save_users_db()
+
+# Initialize session state
+if "history" not in st.session_state:
+    st.session_state.history = []
+if 'last_prediction' not in st.session_state:
+    st.session_state.last_prediction = None
+if 'model_loaded' not in st.session_state:
+    st.session_state.model_loaded = False
+    st.session_state.model = None
+    st.session_state.label_encoder = None
+
+def save_users_db():
+    """Simple function to maintain compatibility"""
     pass
 
-class AudioRecorder:
-    def __init__(self):
-        self.fs = 16000
-        self.duration = 3
+@st.cache_resource
+def load_model_and_encoder():
+    """Load LSTM model and label encoder with optimizations for cloud deployment"""
+    try:
+        debug_logger.info("=== Starting model loading process ===")
+        logger.info("Loading LSTM model...")
+        
+        # Check if models directory exists
+        if not os.path.exists('models'):
+            debug_logger.error("Models directory does not exist!")
+            raise FileNotFoundError("Models directory not found")
+        
+        # List all files in models directory
+        model_files = os.listdir('models')
+        debug_logger.info(f"Files in models directory: {model_files}")
+        
+        # Check if model file exists
+        model_path = 'models/van_et_al.h5'
+        if not os.path.exists(model_path):
+            debug_logger.error(f"Model file not found at: {model_path}")
+            debug_logger.info(f"Available model files: {[f for f in model_files if f.endswith('.h5')]}")
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+        
+        model_size = os.path.getsize(model_path) / (1024*1024)  # MB
+        debug_logger.info(f"Model file size: {model_size:.2f} MB")
+        
+        # Load model with memory optimization
+        debug_logger.info("Loading TensorFlow model...")
+        with tf.device('/CPU:0'):  # Force CPU usage
+            model = tf.keras.models.load_model(model_path, compile=False)
+            debug_logger.info("Model loaded, starting compilation...")
+            
+            # Compile with memory-efficient settings
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+                loss='categorical_crossentropy', 
+                metrics=['accuracy'],
+                run_eagerly=False
+            )
+            debug_logger.info("Model compilation completed")
+            
+        logger.info(f"Model loaded successfully. Input shape: {model.input_shape}")
+        debug_logger.info(f"Model summary - Input: {model.input_shape}, Output: {model.output_shape}")
+        
+        # Load label encoder classes
+        encoder_path = 'models/label_encoder_classes.npy'
+        if not os.path.exists(encoder_path):
+            debug_logger.error(f"Label encoder file not found at: {encoder_path}")
+            raise FileNotFoundError(f"Label encoder file not found: {encoder_path}")
+            
+        debug_logger.info("Loading label encoder...")
+        label_encoder_classes = np.load(encoder_path, allow_pickle=True)
+        label_encoder = LabelEncoder()
+        label_encoder.classes_ = label_encoder_classes
+        logger.info(f"Label encoder loaded with classes: {label_encoder.classes_}")
+        debug_logger.info(f"Label encoder classes type: {type(label_encoder_classes)}, shape: {label_encoder_classes.shape if hasattr(label_encoder_classes, 'shape') else 'N/A'}")
+        
+        debug_logger.info("=== Model loading completed successfully ===")
+        return model, label_encoder
+        
+    except Exception as e:
+        debug_logger.error(f"CRITICAL ERROR in model loading: {str(e)}")
+        debug_logger.error(f"Exception type: {type(e)}")
+        logger.error(f"Error loading model: {str(e)}")
+        raise Exception(f"Model loading failed: {str(e)}")
 
-# Main User Interface
-def user_interface():
-    # Initialize model loading state
-    if 'model_loaded' not in st.session_state:
-        st.session_state.model_loaded = False
-        st.session_state.model = None
-        st.session_state.label_encoder = None
+def record_audio(duration=3, sample_rate=TARGET_SR):
+    """Record audio for a fixed duration"""
+    debug_logger.info(f"=== Starting audio recording - Duration: {duration}s, Sample rate: {sample_rate} ===")
+    audio_data = []
+    recording_errors = []
     
-    # Load model and encoder (non-blocking)
+    def callback(indata, frames, time, status):
+        if status:
+            debug_logger.warning(f"Recording callback status: {status}")
+            recording_errors.append(str(status))
+        audio_data.append(indata.copy())
+        debug_logger.debug(f"Audio chunk received - frames: {frames}, shape: {indata.shape}")
+    
+    try:
+        debug_logger.info("Creating audio input stream...")
+        # Record audio (this is a blocking operation)
+        with sd.InputStream(samplerate=sample_rate, channels=1, callback=callback):
+            debug_logger.info(f"Recording started, sleeping for {duration * 1000}ms...")
+            sd.sleep(int(duration * 1000))
+        
+        debug_logger.info(f"Recording completed. Chunks collected: {len(audio_data)}")
+        
+        if not audio_data:
+            debug_logger.error("No audio data collected!")
+            return None
+        
+        # Concatenate audio data
+        result = np.concatenate(audio_data, axis=0)
+        debug_logger.info(f"Final audio shape: {result.shape}, dtype: {result.dtype}")
+        debug_logger.info(f"Audio stats - min: {np.min(result):.6f}, max: {np.max(result):.6f}, mean: {np.mean(result):.6f}")
+        
+        if recording_errors:
+            debug_logger.warning(f"Recording errors encountered: {recording_errors}")
+        
+        return result
+        
+    except Exception as e:
+        debug_logger.error(f"ERROR in record_audio: {str(e)}")
+        debug_logger.error(f"Exception type: {type(e)}")
+        return None
+
+def pad_audio_min_length(audio, sr, min_mfcc_frames=MIN_MFCC_FRAMES, n_fft=N_FFT, hop_length=HOP_LENGTH):
+    min_len_samples = n_fft + hop_length * (min_mfcc_frames - 1)
+    if len(audio) < min_len_samples:
+        pad_amount = min_len_samples - len(audio)
+        audio = np.pad(audio, (0, pad_amount), mode='constant')
+    return audio
+
+def preprocess_audio(audio_data, sr):
+    debug_logger.info(f"=== Starting audio preprocessing ===")
+    debug_logger.info(f"Input audio shape: {audio_data.shape}, sample rate: {sr}")
+    debug_logger.info(f"Input audio stats - min: {np.min(audio_data):.6f}, max: {np.max(audio_data):.6f}, mean: {np.mean(audio_data):.6f}")
+    
+    try:
+        # Convert to mono if stereo
+        if len(audio_data.shape) > 1:
+            debug_logger.info(f"Converting stereo to mono from shape: {audio_data.shape}")
+            audio_data = np.mean(audio_data, axis=1)
+            debug_logger.info(f"After mono conversion: {audio_data.shape}")
+        
+        # Resample if needed
+        if sr != TARGET_SR:
+            debug_logger.info(f"Resampling from {sr} Hz to {TARGET_SR} Hz")
+            audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=TARGET_SR)
+            debug_logger.info(f"After resampling: {audio_data.shape}")
+        
+        # Truncate silence
+        debug_logger.info("Trimming silence...")
+        original_length = len(audio_data)
+        audio_data, _ = librosa.effects.trim(audio_data, top_db=15)
+        debug_logger.info(f"After trimming: {len(audio_data)} samples (removed {original_length - len(audio_data)} samples)")
+        
+        # Pad if needed
+        debug_logger.info("Padding audio to minimum length...")
+        audio_data = pad_audio_min_length(audio_data, TARGET_SR)
+        debug_logger.info(f"Final preprocessed audio shape: {audio_data.shape}")
+        debug_logger.info(f"Final audio stats - min: {np.min(audio_data):.6f}, max: {np.max(audio_data):.6f}, mean: {np.mean(audio_data):.6f}")
+        
+        debug_logger.info("=== Audio preprocessing completed successfully ===")
+        return audio_data
+        
+    except Exception as e:
+        debug_logger.error(f"ERROR in preprocess_audio: {str(e)}")
+        debug_logger.error(f"Exception type: {type(e)}")
+        st.error(f"Error in audio preprocessing: {str(e)}")
+        return None
+
+def extract_mfcc_features(audio, sr):
+    debug_logger.info(f"=== Starting MFCC feature extraction ===")
+    debug_logger.info(f"Input audio shape: {audio.shape}, sample rate: {sr}")
+    debug_logger.info(f"MFCC parameters - n_mfcc: {N_MFCC}, n_mels: {N_MELS}, hop_length: {HOP_LENGTH}, n_fft: {N_FFT}")
+    
+    try:
+        # Extract MFCC features
+        debug_logger.info("Extracting MFCC features...")
+        mfcc = librosa.feature.mfcc(
+            y=audio, 
+            sr=sr,
+            n_mfcc=N_MFCC,
+            n_mels=N_MELS,
+            hop_length=HOP_LENGTH,
+            n_fft=N_FFT,
+            fmin=FMIN,
+            fmax=FMAX
+        )
+        debug_logger.info(f"Raw MFCC shape: {mfcc.shape}")
+        
+        # Transpose to get time as first dimension
+        debug_logger.info("Transposing MFCC...")
+        mfcc = mfcc.T
+        debug_logger.info(f"After transpose: {mfcc.shape}")
+        
+        # Pad or truncate to match model's expected input length
+        target_length = 104  # Model's expected input length
+        debug_logger.info(f"Adjusting to target length: {target_length}")
+        
+        if mfcc.shape[0] > target_length:
+            debug_logger.info(f"Truncating from {mfcc.shape[0]} to {target_length}")
+            mfcc = mfcc[:target_length, :]
+        elif mfcc.shape[0] < target_length:
+            pad_amount = target_length - mfcc.shape[0]
+            debug_logger.info(f"Padding from {mfcc.shape[0]} to {target_length} (adding {pad_amount} frames)")
+            mfcc = np.pad(mfcc, ((0, pad_amount), (0, 0)), mode='constant')
+        
+        debug_logger.info(f"After length adjustment: {mfcc.shape}")
+        
+        # Reshape to match model's expected input shape (None, 104, 13, 3)
+        debug_logger.info("Reshaping for model input...")
+        mfcc = np.expand_dims(mfcc, axis=-1)  # Add channel dimension
+        debug_logger.info(f"After adding channel dimension: {mfcc.shape}")
+        
+        mfcc = np.repeat(mfcc, 3, axis=-1)    # Repeat to get 3 channels
+        debug_logger.info(f"After repeating to 3 channels: {mfcc.shape}")
+        
+        mfcc = np.expand_dims(mfcc, axis=0)   # Add batch dimension
+        debug_logger.info(f"Final MFCC shape: {mfcc.shape}")
+        
+        # Verify expected shape
+        expected_shape = (1, 104, 13, 3)
+        if mfcc.shape != expected_shape:
+            debug_logger.error(f"Shape mismatch! Got {mfcc.shape}, expected {expected_shape}")
+            return None
+        
+        debug_logger.info(f"MFCC stats - min: {np.min(mfcc):.6f}, max: {np.max(mfcc):.6f}, mean: {np.mean(mfcc):.6f}")
+        debug_logger.info("=== MFCC feature extraction completed successfully ===")
+        
+        return mfcc
+        
+    except Exception as e:
+        debug_logger.error(f"ERROR in extract_mfcc_features: {str(e)}")
+        debug_logger.error(f"Exception type: {type(e)}")
+        st.error(f"Error extracting features: {str(e)}")
+        return None
+
+def predict_audio(features, model, label_encoder):
+    """Make prediction using the model"""
+    debug_logger.info(f"=== Starting audio prediction ===")
+    debug_logger.info(f"Features shape: {features.shape}")
+    debug_logger.info(f"Features stats - min: {np.min(features):.6f}, max: {np.max(features):.6f}, mean: {np.mean(features):.6f}")
+    
+    try:
+        # Verify input shape before prediction
+        expected_shape = (1, 104, 13, 3)
+        if features.shape != expected_shape:
+            debug_logger.error(f"Invalid input shape for prediction: {features.shape}. Expected {expected_shape}")
+            raise ValueError(f"Invalid input shape for prediction: {features.shape}. Expected {expected_shape}")
+        
+        debug_logger.info("Input shape verification passed")
+        
+        # Make prediction
+        debug_logger.info("Making prediction with model...")
+        prediction = model.predict(features, verbose=0)
+        debug_logger.info(f"Raw prediction shape: {prediction.shape}")
+        debug_logger.info(f"Raw prediction values: {prediction}")
+        
+        predicted_class_idx = np.argmax(prediction)
+        debug_logger.info(f"Predicted class index: {predicted_class_idx}")
+        
+        predicted_class = label_encoder.inverse_transform([predicted_class_idx])[0]
+        confidence = np.max(prediction)
+        
+        debug_logger.info(f"Predicted class: {predicted_class}")
+        debug_logger.info(f"Confidence: {confidence}")
+        debug_logger.info(f"All class probabilities: {dict(zip(label_encoder.classes_, prediction[0]))}")
+        debug_logger.info("=== Audio prediction completed successfully ===")
+        
+        return predicted_class, confidence
+        
+    except Exception as e:
+        debug_logger.error(f"ERROR in predict_audio: {str(e)}")
+        debug_logger.error(f"Exception type: {type(e)}")
+        logger.error(f"Error making prediction: {str(e)}")
+        return None, None
+
+def process_and_predict(audio_path, model, label_encoder):
+    debug_logger.info(f"=== Starting process_and_predict ===")
+    debug_logger.info(f"Audio file path: {audio_path}")
+    
+    try:
+        # Check if file exists
+        if not os.path.exists(audio_path):
+            debug_logger.error(f"Audio file not found: {audio_path}")
+            st.error(f"Audio file not found: {audio_path}")
+            return None, None, None
+        
+        file_size = os.path.getsize(audio_path)
+        debug_logger.info(f"Audio file size: {file_size} bytes")
+        
+        # Load and preprocess audio
+        debug_logger.info(f"Loading audio file with librosa (target SR: {TARGET_SR})...")
+        y, sr = librosa.load(audio_path, sr=TARGET_SR)
+        debug_logger.info(f"Loaded audio - shape: {y.shape}, sample rate: {sr}")
+        debug_logger.info(f"Audio duration: {len(y)/sr:.2f} seconds")
+        
+        # Convert to mono if stereo
+        if len(y.shape) > 1:
+            debug_logger.info(f"Converting to mono from shape: {y.shape}")
+            y = librosa.to_mono(y)
+            debug_logger.info(f"After mono conversion: {y.shape}")
+        
+        # Truncate silence (trim audio)
+        debug_logger.info("Trimming silence...")
+        original_length = len(y)
+        y_trimmed, index = librosa.effects.trim(y, top_db=15)
+        y = y_trimmed
+        debug_logger.info(f"After trimming: {len(y)} samples (removed {original_length - len(y)} samples)")
+        
+        # Extract MFCC features
+        debug_logger.info("Extracting MFCC features...")
+        mfcc = librosa.feature.mfcc(
+            y=y, 
+            sr=TARGET_SR,
+            n_mfcc=N_MFCC,
+            n_mels=N_MELS,
+            hop_length=HOP_LENGTH,
+            n_fft=N_FFT,
+            fmin=FMIN,
+            fmax=FMAX
+        )
+        debug_logger.info(f"Raw MFCC shape: {mfcc.shape}")
+        
+        # Transpose to get time as first dimension
+        mfcc = mfcc.T
+        debug_logger.info(f"After transpose: {mfcc.shape}")
+        
+        # Pad or truncate to match model's expected input length
+        target_length = 104  # Model's expected input length
+        debug_logger.info(f"Adjusting to target length: {target_length}")
+        
+        if mfcc.shape[0] > target_length:
+            debug_logger.info(f"Truncating from {mfcc.shape[0]} to {target_length}")
+            mfcc = mfcc[:target_length, :]
+        elif mfcc.shape[0] < target_length:
+            pad_amount = target_length - mfcc.shape[0]
+            debug_logger.info(f"Padding from {mfcc.shape[0]} to {target_length} (adding {pad_amount} frames)")
+            mfcc = np.pad(mfcc, ((0, pad_amount), (0, 0)), mode='constant')
+        
+        # Reshape to match model's expected input shape (None, 104, 13, 3)
+        debug_logger.info("Reshaping for model input...")
+        mfcc = np.expand_dims(mfcc, axis=-1)  # Add channel dimension
+        mfcc = np.repeat(mfcc, 3, axis=-1)    # Repeat to get 3 channels
+        mfcc = np.expand_dims(mfcc, axis=0)   # Add batch dimension
+        debug_logger.info(f"Final MFCC shape: {mfcc.shape}")
+        
+        # Verify the shape
+        expected_shape = (1, 104, 13, 3)
+        if mfcc.shape != expected_shape:
+            debug_logger.error(f"Shape mismatch! Got {mfcc.shape}, expected {expected_shape}")
+            raise ValueError(f"Invalid input shape: {mfcc.shape}. Expected {expected_shape}")
+        
+        debug_logger.info("Shape verification passed, making prediction...")
+        
+        # Make prediction
+        predicted_class, confidence = predict_audio(mfcc, model, label_encoder)
+        
+        if predicted_class is not None:
+            debug_logger.info(f"Prediction successful: {predicted_class} ({confidence:.4f})")
+            
+            # Save processed audio
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            processed_path = f"processed/processed_{timestamp}.wav"
+            debug_logger.info(f"Saving processed audio to: {processed_path}")
+            
+            sf.write(processed_path, y, TARGET_SR)
+            debug_logger.info(f"Processed audio saved successfully")
+            
+            # Add to history
+            history_entry = {
+                "file": processed_path,
+                "label": predicted_class,
+                "confidence": confidence * 100,
+                "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            st.session_state.history.append(history_entry)
+            debug_logger.info(f"Added to history: {history_entry}")
+            
+            debug_logger.info("=== process_and_predict completed successfully ===")
+            return predicted_class, confidence * 100, processed_path
+        else:
+            debug_logger.error("Prediction failed - returned None")
+            st.error("Prediction failed")
+            return None, None, None
+            
+    except Exception as e:
+        debug_logger.error(f"CRITICAL ERROR in process_and_predict: {str(e)}")
+        debug_logger.error(f"Exception type: {type(e)}")
+        import traceback
+        debug_logger.error(f"Traceback: {traceback.format_exc()}")
+        st.error(f"Error processing audio: {str(e)}")
+        return None, None, None
+
+def visualize_audio(audio_path):
+    """Generate basic audio visualization"""
+    try:
+        # Load audio
+        y, sr = librosa.load(audio_path, sr=TARGET_SR)
+        
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+        
+        # Plot waveform
+        librosa.display.waveshow(y, sr=sr, ax=ax1)
+        ax1.set_title('Waveform', fontsize=14, fontweight='bold')
+        ax1.set_xlabel('Time (seconds)')
+        ax1.set_ylabel('Amplitudo')
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot spectrogram
+        D = librosa.amplitude_to_db(np.abs(librosa.stft(y)), ref=np.max)
+        img = librosa.display.specshow(D, y_axis='log', x_axis='time', sr=sr, ax=ax2)
+        ax2.set_title('Spectrogram', fontsize=14, fontweight='bold')
+        ax2.set_xlabel('Time (seconds)')
+        ax2.set_ylabel('Frequency (Hz)')
+        
+        # Add colorbar
+        fig.colorbar(img, ax=ax2, format="%+2.f dB")
+        
+        # Adjust layout
+        plt.tight_layout()
+        
+        return fig
+    except Exception as e:
+        debug_logger.error(f"Error generating visualization: {str(e)}")
+        return None
+
+def generate_comprehensive_visualizations(original_audio_path, processed_audio_data, sr=TARGET_SR):
+    """Generate comprehensive visualizations showing the complete processing pipeline"""
+    try:
+        # Load original audio
+        y_original, sr_orig = librosa.load(original_audio_path, sr=None)
+        if sr_orig != TARGET_SR:
+            y_original_resampled = librosa.resample(y_original, orig_sr=sr_orig, target_sr=TARGET_SR)
+        else:
+            y_original_resampled = y_original
+        
+        # Use processed audio data
+        y_processed = processed_audio_data
+        
+        # Create figure with 4 subplots (2x2)
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+        
+        # 1. Original Waveform
+        time_orig = np.linspace(0, len(y_original_resampled)/TARGET_SR, len(y_original_resampled))
+        ax1.plot(time_orig, y_original_resampled, color='blue', alpha=0.7)
+        ax1.set_title('🎵 Waveform Input Original', fontsize=14, fontweight='bold')
+        ax1.set_xlabel('Waktu (detik)')
+        ax1.set_ylabel('Amplitudo')
+        ax1.grid(True, alpha=0.3)
+        ax1.set_xlim(0, max(time_orig))
+        
+        # 2. Processed Waveform (after preprocessing)
+        time_proc = np.linspace(0, len(y_processed)/TARGET_SR, len(y_processed))
+        ax2.plot(time_proc, y_processed, color='green', alpha=0.7)
+        ax2.set_title('🔧 Waveform Setelah Preprocessing', fontsize=14, fontweight='bold')
+        ax2.set_xlabel('Waktu (detik)')
+        ax2.set_ylabel('Amplitudo')
+        ax2.grid(True, alpha=0.3)
+        ax2.set_xlim(0, max(time_proc))
+        
+        # 3. MFCC Features (basic)
+        mfcc_basic = librosa.feature.mfcc(y=y_processed, sr=sr, n_mfcc=N_MFCC, n_fft=N_FFT, hop_length=HOP_LENGTH)
+        img1 = librosa.display.specshow(mfcc_basic, sr=sr, x_axis='time', ax=ax3, cmap='viridis')
+        ax3.set_title('📊 MFCC Features (13 coefficients)', fontsize=14, fontweight='bold')
+        ax3.set_xlabel('Waktu (detik)')
+        ax3.set_ylabel('MFCC Coefficients')
+        fig.colorbar(img1, ax=ax3, format="%.2f")
+        
+        # 4. MFCC + Delta + Delta-Delta (what model actually uses)
+        mfcc = librosa.feature.mfcc(y=y_processed, sr=sr, n_mfcc=N_MFCC, n_fft=N_FFT, hop_length=HOP_LENGTH)
+        delta = librosa.feature.delta(mfcc)
+        delta2 = librosa.feature.delta(mfcc, order=2)
+        
+        # Stack all features (3, 13, time_steps)
+        mfcc_stack = np.stack([mfcc, delta, delta2], axis=0)
+        # Reshape to (time_steps, 13, 3) then flatten to (time_steps, 39) for visualization
+        mfcc_combined = mfcc_stack.transpose(2, 1, 0)  # (time_steps, 13, 3)
+        mfcc_flattened = mfcc_combined.reshape(mfcc_combined.shape[0], -1)  # (time_steps, 39)
+        
+        img2 = ax4.imshow(mfcc_flattened.T, aspect='auto', origin='lower', cmap='plasma')
+        ax4.set_title('🎯 MFCC + Delta + Delta-Delta (Input Model)', fontsize=14, fontweight='bold')
+        ax4.set_xlabel('Time Frames')
+        ax4.set_ylabel('Features (MFCC + Δ + ΔΔ)')
+        
+        # Add feature labels
+        feature_labels = []
+        for i in range(13):
+            feature_labels.append(f'MFCC_{i+1}')
+        for i in range(13):
+            feature_labels.append(f'Δ_{i+1}')
+        for i in range(13):
+            feature_labels.append(f'ΔΔ_{i+1}')
+        
+        # Set y-tick labels for every 5th feature to avoid crowding
+        y_ticks = range(0, 39, 5)
+        ax4.set_yticks(y_ticks)
+        ax4.set_yticklabels([feature_labels[i] for i in y_ticks], fontsize=8)
+        
+        fig.colorbar(img2, ax=ax4, format="%.2f")
+        
+        # Adjust layout
+        plt.tight_layout()
+        
+        # Convert to base64
+        buffer = BytesIO()
+        plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
+        buffer.seek(0)
+        image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        plt.close(fig)
+        
+        return image_base64
+    except Exception as e:
+        debug_logger.error(f"Error generating comprehensive visualizations: {str(e)}")
+        return None
+
+def generate_audio_visualizations(audio_path):
+    """Generate waveform and spectrogram visualizations"""
+    try:
+        # Load audio
+        y, sr = librosa.load(audio_path, sr=TARGET_SR)
+        
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+        
+        # Plot waveform
+        librosa.display.waveshow(y, sr=sr, ax=ax1)
+        ax1.set_title('Waveform', fontsize=14, fontweight='bold')
+        ax1.set_xlabel('Waktu (detik)')
+        ax1.set_ylabel('Amplitudo')
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot spectrogram
+        D = librosa.amplitude_to_db(np.abs(librosa.stft(y)), ref=np.max)
+        img = librosa.display.specshow(D, y_axis='log', x_axis='time', sr=sr, ax=ax2)
+        ax2.set_title('Spectrogram', fontsize=14, fontweight='bold')
+        ax2.set_xlabel('Waktu (detik)')
+        ax2.set_ylabel('Frekuensi (Hz)')
+        
+        # Add colorbar
+        fig.colorbar(img, ax=ax2, format="%+2.f dB")
+        
+        # Adjust layout
+        plt.tight_layout()
+        
+        # Convert to base64
+        buffer = BytesIO()
+        plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
+        buffer.seek(0)
+        image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        plt.close(fig)
+        
+        return image_base64
+    except Exception as e:
+        debug_logger.error(f"Error generating visualizations: {str(e)}")
+        return None
+
+def generate_mfcc_visualization(audio_path):
+    """Generate MFCC feature visualization"""
+    try:
+        # Load audio
+        y, sr = librosa.load(audio_path, sr=TARGET_SR)
+        
+        # Extract MFCC features
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=N_MFCC, n_fft=N_FFT, hop_length=HOP_LENGTH)
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(12, 6))
+        
+        # Plot MFCC
+        img = librosa.display.specshow(mfcc, sr=sr, x_axis='time', ax=ax, cmap='coolwarm')
+        ax.set_title('MFCC Features', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Waktu (detik)')
+        ax.set_ylabel('MFCC Coefficients')
+        
+        # Add colorbar
+        fig.colorbar(img, ax=ax, format="%.2f")
+        
+        # Adjust layout
+        plt.tight_layout()
+        
+        # Convert to base64
+        buffer = BytesIO()
+        plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
+        buffer.seek(0)
+        image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        plt.close(fig)
+        
+        return image_base64
+    except Exception as e:
+        debug_logger.error(f"Error generating MFCC visualization: {str(e)}")
+        return None
+
+def user_interface():
+    debug_logger.info("=== STARTING USER INTERFACE ===")
+    debug_logger.info(f"Session state model_loaded: {st.session_state.get('model_loaded', False)}")
+    
+    # Initialize model loading state
     if not st.session_state.model_loaded:
+        debug_logger.info("Model not loaded, starting initialization...")
         st.markdown("## 🤖 Initializing Emergency Voice Detection System")
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         try:
+            debug_logger.info("Starting model loading process...")
             status_text.text("🔄 Loading TensorFlow model...")
             progress_bar.progress(25)
             
             model, label_encoder = load_model_and_encoder()
+            debug_logger.info("Model and encoder loaded successfully")
             
             progress_bar.progress(75)
             status_text.text("✅ Model loaded successfully!")
@@ -584,6 +903,7 @@ def user_interface():
             st.session_state.model = model
             st.session_state.label_encoder = label_encoder
             st.session_state.model_loaded = True
+            debug_logger.info("Model stored in session state")
             
             progress_bar.progress(100)
             status_text.text("🚀 System ready!")
@@ -592,9 +912,15 @@ def user_interface():
             import time
             time.sleep(1)
             
+            debug_logger.info("Model initialization completed, triggering rerun...")
             st.rerun()
             
         except Exception as e:
+            debug_logger.error(f"CRITICAL ERROR during model initialization: {str(e)}")
+            debug_logger.error(f"Exception type: {type(e)}")
+            import traceback
+            debug_logger.error(f"Traceback: {traceback.format_exc()}")
+            
             progress_bar.empty()
             status_text.empty()
             st.error(f"❌ Failed to load model: {e}")
@@ -801,56 +1127,27 @@ def user_interface():
 
 def handle_recording(model, label_encoder):
     try:
-        st.info("🎙️ Klik tombol mikrofon di bawah untuk merekam suara")
-        
-        # Use streamlit-mic-recorder for recording
-        audio_data = mic_recorder(
-            start_prompt="🎙️ Mulai Rekam",
-            stop_prompt="⏹️ Stop Rekam", 
-            just_once=False,
-            use_container_width=True,
-            callback=None,
-            args=(),
-            kwargs={},
-            key="mic_recorder"
-        )
-        
-        if audio_data is not None:
-            st.success("✅ Audio berhasil direkam!")
+        with st.spinner("🎙️ Sedang merekam suara... (3 detik)"):
+            fs = 16000
+            duration = 3
+            audio = sd.rec(int(duration * fs), samplerate=fs, channels=1)
+            sd.wait()
             
-            with st.spinner("🔄 Memproses rekaman audio..."):
-                try:
-                    # Save the recorded audio to a temporary file
-                    filename = f"data/{st.session_state.current_user}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-                    
-                    # Save the audio data (mic_recorder returns dict with 'bytes' key)
-                    with open(filename, "wb") as f:
-                        f.write(audio_data['bytes'])
-                    
-                    st.info(f"📁 File audio disimpan sebagai: {filename}")
-                    
-                    # Verify file was created and has content
-                    if os.path.exists(filename) and os.path.getsize(filename) > 0:
-                        st.success(f"✅ File berhasil disimpan ({os.path.getsize(filename)} bytes)")
-                        
-                        # Process the audio
-                        process_audio_file(filename, model, label_encoder, is_recorded=True)
-                    else:
-                        st.error("❌ File audio kosong atau tidak dapat disimpan")
-                        
-                except Exception as processing_error:
-                    st.error(f"❌ Error saat memproses audio: {str(processing_error)}")
-                    logger.error(f"Audio processing error: {str(processing_error)}")
+            # Save the recorded audio to a temporary file
+            filename = f"data/{st.session_state.current_user}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+            sf.write(filename, audio, fs)
+            
+            # Process the audio
+            process_audio_file(filename, model, label_encoder, is_recorded=True)
 
     except Exception as e:
         st.error(f"❌ Gagal merekam audio: {e}")
-        logger.error(f"Recording error: {str(e)}")
 
 def handle_upload(uploaded_file, model, label_encoder):
     try:
         with st.spinner("📤 Memproses file audio..."):
             # Save the uploaded file temporarily
-            temp_filename = f"data/uploaded_{st.session_state.current_user}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+            temp_filename = f"data/uploaded_{st.session_state.current_user}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
             with open(temp_filename, "wb") as f:
                 f.write(uploaded_file.getbuffer())
             
@@ -863,105 +1160,98 @@ def handle_upload(uploaded_file, model, label_encoder):
 def process_audio_file(audio_path, model, label_encoder, is_recorded=True):
     """Process audio file and generate predictions and visualizations"""
     try:
-        st.info(f"🔄 Memulai analisis file: {audio_path}")
-        
         with st.spinner("🔄 Menganalisis audio..."):
-            # Check if file exists and has content
-            if not os.path.exists(audio_path):
-                st.error(f"❌ File tidak ditemukan: {audio_path}")
-                return
-                
-            file_size = os.path.getsize(audio_path)
-            if file_size == 0:
-                st.error(f"❌ File kosong: {audio_path}")
-                return
-                
-            st.info(f"📊 Memuat file audio ({file_size} bytes)...")
-            
             # Load and preprocess audio
             audio_data, sr = librosa.load(audio_path, sr=None)
-            st.info(f"✅ Audio dimuat - Sample rate: {sr}, Duration: {len(audio_data)/sr:.2f}s")
-            
             processed_audio = preprocess_audio(audio_data, sr)
             
             if processed_audio is None:
                 st.error("❌ Gagal memproses audio")
                 return
-                
-            st.info("✅ Audio berhasil dipreprocess")
             
             # Save processed audio
-            processed_filename = f"data/processed_{st.session_state.current_user}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+            processed_filename = f"data/processed_{st.session_state.current_user}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
             sf.write(processed_filename, processed_audio, TARGET_SR)
-            st.info(f"✅ Audio processed disimpan: {processed_filename}")
             
             # Extract features for prediction
-            st.info("🔍 Mengekstrak fitur MFCC...")
             features = extract_mfcc_features(processed_audio, TARGET_SR)
             
             if features is None:
                 st.error("❌ Gagal mengekstrak fitur audio")
                 return
-                
-            st.info(f"✅ Fitur MFCC berhasil diekstrak - Shape: {features.shape}")
             
             # Make prediction
-            st.info("🤖 Melakukan prediksi dengan model AI...")
             predicted_class, confidence = predict_audio(features, model, label_encoder)
             
             if predicted_class is None:
-                st.error("❌ Gagal melakukan prediksi")
+                st.error("❌ Gagal membuat prediksi")
                 return
-                
-            st.success(f"✅ Prediksi berhasil - Kelas: {predicted_class}, Confidence: {confidence:.2f}")
-            
-            # Determine if urgent
-            is_urgent = predicted_class == 'kata_darurat'
             
             # Generate visualizations
+            visualizations = {}
+            
+            # Comprehensive visualization
             comprehensive_viz = generate_comprehensive_visualizations(audio_path, processed_audio, TARGET_SR)
+            if comprehensive_viz:
+                visualizations['comprehensive_visualization'] = comprehensive_viz
+            
+            # Waveform and spectrogram
             waveform_viz = generate_audio_visualizations(processed_filename)
+            if waveform_viz:
+                visualizations['waveform_spectrogram'] = waveform_viz
+            
+            # MFCC visualization
             mfcc_viz = generate_mfcc_visualization(processed_filename)
+            if mfcc_viz:
+                visualizations['mfcc_visualization'] = mfcc_viz
             
-            # Update session state with results
+            # Store results in session state
             st.session_state.result = {
-                'is_urgent': is_urgent,
-                'confidence': confidence,
                 'predicted_class': predicted_class,
-                'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'file_path': processed_filename
+                'confidence': confidence,
+                'is_urgent': predicted_class == 'kata_darurat',
+                'file_path': processed_filename,
+                'original_path': audio_path
             }
+            st.session_state.visualizations = visualizations
             
-            # Store visualizations in session state
-            st.session_state.visualizations = {
-                'comprehensive_visualization': comprehensive_viz,
-                'waveform_spectrogram': waveform_viz,
-                'mfcc_visualization': mfcc_viz
-            }
-            
-            # Update history
+            # Add to history
             USERS_DB[st.session_state.current_user]["history"].append({
-                'time': st.session_state.result['time'],
-                'status': 'DARURAT' if st.session_state.result['is_urgent'] else 'AMAN',
-                'confidence': round(st.session_state.result['confidence']*100, 1),
-                'predicted_class': st.session_state.result['predicted_class'],
-                'file_path': st.session_state.result['file_path']
+                'time': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'status': 'DARURAT' if predicted_class == 'kata_darurat' else 'AMAN',
+                'confidence': round(confidence * 100, 1),
+                'predicted_class': predicted_class,
+                'file_path': processed_filename
             })
-            
             save_users_db()
-            st.success("✅ Audio berhasil dianalisis!")
-            st.rerun()
+            
+            st.success("✅ Analisis selesai!")
             
     except Exception as e:
-        st.error(f"❌ Terjadi kesalahan saat memproses audio: {e}")
-        logger.error(f"Error processing audio: {e}")
+        st.error(f"❌ Error dalam pemrosesan audio: {e}")
+        debug_logger.error(f"Error in process_audio_file: {str(e)}")
 
 def main():
+    debug_logger.info("=== APPLICATION STARTING ===")
+    debug_logger.info(f"Python version: {os.sys.version}")
+    debug_logger.info(f"Working directory: {os.getcwd()}")
+    debug_logger.info(f"Available directories: {[d for d in os.listdir('.') if os.path.isdir(d)]}")
+    
     try:
+        debug_logger.info("Calling user_interface()...")
         user_interface()
+        debug_logger.info("user_interface() completed successfully")
+        
     except Exception as e:
+        debug_logger.error(f"CRITICAL ERROR in main(): {str(e)}")
+        debug_logger.error(f"Exception type: {type(e)}")
+        import traceback
+        debug_logger.error(f"Traceback: {traceback.format_exc()}")
+        
         st.error(f"❌ Application error: {str(e)}")
         logger.error(f"Main application error: {str(e)}")
 
 if __name__ == "__main__":
+    debug_logger.info("=== SCRIPT EXECUTION STARTED ===")
+    debug_logger.info("Starting main function...")
     main()
